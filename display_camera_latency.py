@@ -6,13 +6,14 @@ Point the camera at the screen (or the projected image) so the image covers the 
 of the camera view. A full-screen window toggles black/white; a camera thread timestamps
 every frame; latency = first bright frame time - time Python issued the white command.
 
-Run it twice to separate the projector from the camera:
+Run it twice to separate the projector from the camera (x offsets from `xrandr --listmonitors`):
     python display_camera_latency.py --display-x 0       # monitor
-    python display_camera_latency.py --display-x 1920    # projector (extended desktop, right of a 1920-px monitor)
+    python display_camera_latency.py --display-x 1920    # projector to the right of a 1920-px monitor
 
     loop(projector) - loop(monitor)  = projector lag - monitor lag
     loop(monitor)   - monitor lag    = camera + Python acquisition latency
 
+Use an X11 session (Ubuntu on Xorg): under Wayland the window cannot be moved to another display.
 Press ESC in the window to abort.
 """
 import argparse
@@ -23,6 +24,8 @@ import time
 import cv2
 import numpy as np
 
+from camsource import add_camera_args, open_camera, roi_mean
+
 
 def report(name, ms):
     ms = np.asarray(ms)
@@ -30,49 +33,35 @@ def report(name, ms):
           f"min {ms.min():8.3f} | p95 {np.percentile(ms, 95):8.3f} | max {ms.max():8.3f}  ms (n={ms.size})")
 
 
-class Camera(threading.Thread):
+class CameraThread(threading.Thread):
     """Reads frames as fast as the camera delivers them; stores (timestamp, mean of centre ROI)."""
 
-    def __init__(self, index, width, height, fps, roi):
+    def __init__(self, cam, roi):
         super().__init__(daemon=True)
-        self.cap = cv2.VideoCapture(index)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self.cap.set(cv2.CAP_PROP_FPS, fps)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        if not self.cap.isOpened():
-            raise SystemExit("Cannot open camera")
-        self.roi = roi
+        self.cam, self.roi = cam, roi
         self.samples = []  # (t, mean); list.append is atomic in CPython, so no lock needed
         self.running = True
 
     def run(self):
         while self.running:
-            ok, frame = self.cap.read()
+            img, _ = self.cam.read()
             t = time.perf_counter()
-            if not ok:
-                continue
-            h, w = frame.shape[:2]
-            dy, dx = max(1, int(h * self.roi / 2)), max(1, int(w * self.roi / 2))
-            m = float(frame[h // 2 - dy:h // 2 + dy, w // 2 - dx:w // 2 + dx].mean())
-            self.samples.append((t, m))
-        self.cap.release()
+            if img is not None:
+                self.samples.append((t, roi_mean(img, self.roi)))
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--cam", type=int, default=0)
-    ap.add_argument("--width", type=int, default=640)
-    ap.add_argument("--height", type=int, default=480)
-    ap.add_argument("--fps", type=int, default=60)
-    ap.add_argument("--display-x", type=int, default=0, help="x offset of the target display in the virtual desktop")
+    ap = add_camera_args(argparse.ArgumentParser())
+    ap.add_argument("--display-x", type=int, default=0, help="x offset of the target display in the X11 desktop")
     ap.add_argument("--display-y", type=int, default=0)
     ap.add_argument("--trials", type=int, default=50)
     ap.add_argument("--roi", type=float, default=0.3, help="centre fraction of the camera frame used for brightness")
     a = ap.parse_args()
 
-    cam = Camera(a.cam, a.width, a.height, a.fps, a.roi)
-    cam.start()
+    cam = open_camera(a)
+    print(cam.info)
+    ct = CameraThread(cam, a.roi)
+    ct.start()
 
     win = "latency"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
@@ -95,14 +84,14 @@ def main():
 
     def level(seconds):
         now = time.perf_counter()
-        vals = [m for t, m in cam.samples[-300:] if t > now - seconds]
+        vals = [m for t, m in ct.samples[-300:] if t > now - seconds]
         return float(np.mean(vals)) if vals else float("nan")
 
     def wait_for(idx, t0, cond, timeout=2.0):
         end = time.perf_counter() + timeout
         while time.perf_counter() < end:
-            n = len(cam.samples)
-            for t, m in cam.samples[idx:n]:
+            n = len(ct.samples)
+            for t, m in ct.samples[idx:n]:
                 if t > t0 and cond(m):
                     return t
             idx = n
@@ -118,7 +107,7 @@ def main():
         pump(1.0)
         hi = level(0.5)
         thr = 0.5 * (lo + hi)
-        ts = [t for t, _ in cam.samples[-60:]]
+        ts = [t for t, _ in ct.samples[-60:]]
         period = float(np.median(np.diff(ts))) * 1e3 if len(ts) > 2 else float("nan")
         print(f"black {lo:.1f}  white {hi:.1f}  threshold {thr:.1f}  camera frame period {period:.1f} ms")
         if not hi - lo > 20:
@@ -126,12 +115,12 @@ def main():
 
         lat = []
         for k in range(a.trials):
-            idx = len(cam.samples)
+            idx = len(ct.samples)
             t = show(black)
             wait_for(idx, t, lambda m: m < thr)
             pump(random.uniform(0.2, 0.5))  # random phase w.r.t. camera and display clocks
 
-            idx = len(cam.samples)
+            idx = len(ct.samples)
             t0 = show(white)
             t1 = wait_for(idx, t0, lambda m: m > thr)
             if t1 is None:
@@ -146,7 +135,9 @@ def main():
     except KeyboardInterrupt:
         print("aborted")
     finally:
-        cam.running = False
+        ct.running = False
+        ct.join(timeout=3)
+        cam.close()
         cv2.destroyAllWindows()
 
 

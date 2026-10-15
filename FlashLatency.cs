@@ -3,29 +3,37 @@
 // Unity clears the screen black/white; a physical camera watches it; Unity measures the time
 // from "set white" until Unity's main thread knows the camera saw white.
 //
-//   Source = UnityWebcam  : camera read natively in Unity (WebCamTexture)
-//   Source = PythonCamera : camera read by camera_publisher.py, sent to Unity over ZeroMQ
-//                           together with a ~500 KB payload per frame
+//   Source = UnityRealSense : D435 read natively in Unity through the RealSense C# wrapper
+//                             (needs the REALSENSE_SDK scripting define, see README)
+//   Source = UnityWebcam    : camera read through Unity's WebCamTexture (V4L2 on Linux)
+//   Source = PythonCamera   : camera read by camera_publisher.py, sent to Unity over ZeroMQ
+//                             together with a ~500 KB payload per frame
 //
-// Same display, same detection code, same clock -> the two numbers are directly comparable.
+// Same display, same detection code, same clock -> the numbers are directly comparable.
+// UnityRealSense vs PythonCamera is the fair comparison: same SDK, same camera mode.
 using System;
 using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using NetMQ;
 using NetMQ.Sockets;
 using UnityEngine;
 using Debug = UnityEngine.Debug;
+#if REALSENSE_SDK
+using Intel.RealSense;
+using RsStream = Intel.RealSense.Stream;
+#endif
 
 [RequireComponent(typeof(Camera))]
 public class FlashLatency : MonoBehaviour
 {
-    public enum Source { UnityWebcam, PythonCamera }
+    public enum Source { UnityRealSense, UnityWebcam, PythonCamera }
 
-    public Source source = Source.UnityWebcam;
+    public Source source = Source.UnityRealSense;
 
     [Header("Display")]
     public int targetDisplay = 0;      // 1 = second display (projector); multi-display works in a build
@@ -36,8 +44,14 @@ public class FlashLatency : MonoBehaviour
     public int trials = 50;
     [Range(0.05f, 1f)] public float roi = 0.3f;
 
+    [Header("UnityRealSense")]
+    public bool rsInfrared = false;    // false = colour (max 60 fps), true = left IR (global shutter, up to 90 fps @ 848x480)
+    public int rsWidth = 640, rsHeight = 480, rsFps = 60;
+    public float rsExposure = 0f;      // 0 = auto; otherwise raw sensor units (python camera_timing.py --list shows the range)
+
     [Header("UnityWebcam")]
-    public string webcamName = "";     // empty = first device
+    public int webcamIndex = -1;       // -1 = use webcamName (or the first device); the D435 shows up as several devices
+    public string webcamName = "";
     public int camWidth = 640, camHeight = 480, camFps = 60;
 
     [Header("PythonCamera")]
@@ -47,8 +61,8 @@ public class FlashLatency : MonoBehaviour
     WebCamTexture webcam;
     Color32[] pixels;
     readonly List<(long t, double m)> samples = new List<(long, double)>();
-    readonly ConcurrentQueue<double> fromPython = new ConcurrentQueue<double>();
-    Thread subThread;
+    readonly ConcurrentQueue<double> fromThread = new ConcurrentQueue<double>();
+    Thread worker;
     volatile bool running = true;
 
     void Start()
@@ -67,20 +81,40 @@ public class FlashLatency : MonoBehaviour
             cam.targetDisplay = targetDisplay;
         }
 
-        if (source == Source.UnityWebcam)
+        switch (source)
         {
-            if (WebCamTexture.devices.Length == 0) { Debug.LogError("No webcam found"); return; }
-            string dev = string.IsNullOrEmpty(webcamName) ? WebCamTexture.devices[0].name : webcamName;
-            webcam = new WebCamTexture(dev, camWidth, camHeight, camFps);
-            webcam.Play();
-        }
-        else
-        {
-            AsyncIO.ForceDotNet.Force();
-            subThread = new Thread(SubLoop) { IsBackground = true };
-            subThread.Start();
+            case Source.UnityWebcam:
+                if (!StartWebcam()) return;
+                break;
+            case Source.UnityRealSense:
+#if REALSENSE_SDK
+                worker = new Thread(RealSenseLoop) { IsBackground = true };
+                worker.Start();
+                break;
+#else
+                Debug.LogError("Source = UnityRealSense needs the RealSense C# wrapper and the REALSENSE_SDK scripting define (see README).");
+                return;
+#endif
+            case Source.PythonCamera:
+                AsyncIO.ForceDotNet.Force();
+                worker = new Thread(SubLoop) { IsBackground = true };
+                worker.Start();
+                break;
         }
         StartCoroutine(RunTest());
+    }
+
+    bool StartWebcam()
+    {
+        var devs = WebCamTexture.devices;
+        for (int i = 0; i < devs.Length; i++) Debug.Log($"[FlashLatency] webcam [{i}] '{devs[i].name}'");
+        if (devs.Length == 0) { Debug.LogError("No webcam found"); return false; }
+        string dev = webcamIndex >= 0 && webcamIndex < devs.Length ? devs[webcamIndex].name
+                   : string.IsNullOrEmpty(webcamName) ? devs[0].name : webcamName;
+        Debug.Log($"[FlashLatency] opening webcam '{dev}'");
+        webcam = new WebCamTexture(dev, camWidth, camHeight, camFps);
+        webcam.Play();
+        return true;
     }
 
     void Update()
@@ -95,10 +129,71 @@ public class FlashLatency : MonoBehaviour
         }
         else
         {
-            while (fromPython.TryDequeue(out double m))
+            // Background threads only compute the ROI mean; the timestamp is taken here,
+            // when the main thread (game logic) actually has the value.
+            while (fromThread.TryDequeue(out double m))
                 samples.Add((Stopwatch.GetTimestamp(), m));
         }
     }
+
+#if REALSENSE_SDK
+    void RealSenseLoop()
+    {
+        try
+        {
+            using (var pipe = new Pipeline())
+            using (var cfg = new Config())
+            {
+                if (rsInfrared) cfg.EnableStream(RsStream.Infrared, 1, rsWidth, rsHeight, Format.Y8, rsFps);
+                else cfg.EnableStream(RsStream.Color, rsWidth, rsHeight, Format.Rgb8, rsFps);
+
+                using (var profile = pipe.Start(cfg))
+                {
+                    var dev = profile.Device;
+                    Debug.Log($"[FlashLatency] RealSense {dev.Info[CameraInfo.Name]} USB {dev.Info[CameraInfo.UsbTypeDescriptor]}, " +
+                              $"{(rsInfrared ? "IR" : "colour")} {rsWidth}x{rsHeight}@{rsFps}");
+                    foreach (var s in dev.Sensors)
+                    {
+                        string name = s.Info[CameraInfo.Name] ?? "";
+                        bool target = rsInfrared ? name.Contains("Stereo") : name.Contains("RGB");
+                        if (!target) continue;
+                        TrySet(s, Option.AutoExposurePriority, 0f);   // never lower the fps for longer exposure
+                        if (rsInfrared) TrySet(s, Option.EmitterEnabled, 0f);
+                        if (rsExposure > 0)
+                        {
+                            TrySet(s, Option.EnableAutoExposure, 0f);
+                            TrySet(s, Option.Exposure, rsExposure);
+                        }
+                    }
+
+                    int bpp = rsInfrared ? 1 : 3;
+                    byte[] buf = null;
+                    while (running)
+                    {
+                        if (!pipe.TryWaitForFrames(out FrameSet fs, 1000)) continue;
+                        using (fs)
+                        using (var f = rsInfrared ? fs.InfraredFrame : fs.ColorFrame)
+                        {
+                            if (f == null) continue;
+                            int n = f.Stride * f.Height;
+                            if (buf == null || buf.Length != n) buf = new byte[n];
+                            Marshal.Copy(f.Data, buf, 0, n);
+                            fromThread.Enqueue(RoiMean(buf, f.Width, f.Height, f.Stride, bpp));
+                        }
+                    }
+                    pipe.Stop();
+                }
+            }
+        }
+        catch (Exception e) { if (running) Debug.LogException(e); }
+    }
+
+    static void TrySet(Sensor s, Option o, float v)
+    {
+        try { if (s.Options.Supports(o)) s.Options[o].Value = v; }
+        catch (Exception e) { Debug.LogWarning($"[FlashLatency] could not set {o}: {e.Message}"); }
+    }
+#endif
 
     void SubLoop()
     {
@@ -117,7 +212,7 @@ public class FlashLatency : MonoBehaviour
                     int n = (msg.Length - 16) / 4;                  // payload: float32 vector
                     if (payload == null || payload.Length != n) payload = new float[n];
                     Buffer.BlockCopy(msg, 16, payload, 0, n * 4);   // deserialize, as a real consumer would
-                    fromPython.Enqueue(mean);
+                    fromThread.Enqueue(mean);
                 }
             }
         }
@@ -131,7 +226,10 @@ public class FlashLatency : MonoBehaviour
         {
             if (Time.realtimeSinceStartup > deadline)
             {
-                Debug.LogError("No camera samples. " + (source == Source.PythonCamera ? "Is camera_publisher.py running?" : "Check the webcam."));
+                string hint = source == Source.PythonCamera ? "Is camera_publisher.py running?"
+                            : source == Source.UnityRealSense ? "Is the D435 connected, and is no other program (Python, realsense-viewer) using it?"
+                            : "Check the webcam, or try another webcamIndex (the D435 RGB stream is one of several entries).";
+                Debug.LogError("No camera samples. " + hint);
                 yield break;
             }
             yield return null;
@@ -212,6 +310,21 @@ public class FlashLatency : MonoBehaviour
         return cnt == 0 ? 0 : sum / (3.0 * cnt);
     }
 
+    // Raw 8-bit image (bpp = 1 for Y8, 3 for RGB8) with row stride in bytes
+    double RoiMean(byte[] p, int w, int h, int stride, int bpp)
+    {
+        int dx = Math.Max(1, (int)(w * roi / 2)), dy = Math.Max(1, (int)(h * roi / 2));
+        long sum = 0;
+        int cnt = 0;
+        for (int y = h / 2 - dy; y < h / 2 + dy; y++)
+        {
+            int start = y * stride + (w / 2 - dx) * bpp, end = y * stride + (w / 2 + dx) * bpp;
+            for (int i = start; i < end; i++) sum += p[i];
+            cnt += end - start;
+        }
+        return cnt == 0 ? 0 : (double)sum / cnt;
+    }
+
     double LevelOverLast(double seconds)
     {
         long from = Stopwatch.GetTimestamp() - (long)(seconds * Stopwatch.Frequency);
@@ -243,10 +356,10 @@ public class FlashLatency : MonoBehaviour
     {
         running = false;
         if (webcam != null) webcam.Stop();
-        if (subThread != null)
+        if (worker != null)
         {
-            subThread.Join(500);
-            NetMQConfig.Cleanup(false);
+            worker.Join(1500);                      // RealSense: lets the pipeline stop and release the camera
+            if (source == Source.PythonCamera) NetMQConfig.Cleanup(false);
         }
     }
 }
